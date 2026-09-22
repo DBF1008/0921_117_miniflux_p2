@@ -18,7 +18,9 @@ import (
 	"miniflux.app/v2/internal/reader/icon"
 	"miniflux.app/v2/internal/reader/parser"
 	"miniflux.app/v2/internal/reader/processor"
+	"miniflux.app/v2/internal/reader/ratelimit"
 	"miniflux.app/v2/internal/storage"
+	"miniflux.app/v2/internal/urllib"
 )
 
 var (
@@ -253,12 +255,19 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 	responseHandler := fetcher.NewResponseHandler(requestBuilder.ExecuteRequest(originalFeed.FeedURL))
 	defer responseHandler.Close()
 
+	// The host limiter is shared with the fetcher and scheduler layers: the
+	// outcome of this refresh drives the adaptive backoff of the feed host.
+	hostLimiter := ratelimit.Shared()
+	feedHostname := urllib.Domain(originalFeed.FeedURL)
+
 	if responseHandler.IsRateLimited() {
 		retryDelay := responseHandler.ParseRetryDelay()
 		calculatedNextCheckInterval := originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+		hostLimiter.ReportFailure(feedHostname, retryDelay)
 
 		slog.Warn("Feed is rate limited",
 			slog.String("feed_url", originalFeed.FeedURL),
+			slog.String("feed_hostname", feedHostname),
 			slog.Int("retry_delay_in_seconds", int(retryDelay.Seconds())),
 			slog.Int("calculated_next_check_interval_in_minutes", int(calculatedNextCheckInterval.Minutes())),
 			slog.Time("new_next_check_at", originalFeed.NextCheckAt),
@@ -266,10 +275,16 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 	}
 
 	if localizedError := responseHandler.LocalizedError(); localizedError != nil {
+		if !responseHandler.IsRateLimited() {
+			hostLimiter.ReportFailure(feedHostname, 0)
+		}
+
 		slog.Warn("Unable to fetch feed",
 			slog.Int64("user_id", userID),
 			slog.Int64("feed_id", feedID),
 			slog.String("feed_url", originalFeed.FeedURL),
+			slog.String("feed_hostname", feedHostname),
+			slog.Int("consecutive_failures", hostLimiter.FailureCount(feedHostname)),
 			slog.Any("error", localizedError.Error()),
 		)
 		return getTranslatedLocalizedError(store, userID, originalFeed, localizedError)
@@ -290,6 +305,7 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 
 		responseBody, localizedError := responseHandler.ReadBody(config.Opts.HTTPClientMaxBodySize())
 		if localizedError != nil {
+			hostLimiter.ReportFailure(feedHostname, 0)
 			slog.Warn("Unable to fetch feed", slog.String("feed_url", originalFeed.FeedURL), slog.Any("error", localizedError.Error()))
 			return localizedError
 		}
@@ -378,6 +394,8 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 		localizedError := locale.NewLocalizedErrorWrapper(storeErr, "error.database_error", storeErr)
 		return getTranslatedLocalizedError(store, userID, originalFeed, localizedError)
 	}
+
+	hostLimiter.ReportSuccess(feedHostname)
 
 	return nil
 }

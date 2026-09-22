@@ -20,6 +20,7 @@ import (
 
 	"miniflux.app/v2/internal/config"
 	"miniflux.app/v2/internal/proxyrotator"
+	"miniflux.app/v2/internal/reader/ratelimit"
 	"miniflux.app/v2/internal/urllib"
 )
 
@@ -279,6 +280,13 @@ func (r *RequestBuilder) ExecuteRequest(requestURL string) (*http.Response, erro
 		slog.Bool("ignore_tls_errors", r.ignoreTLSErrors),
 		slog.Bool("disable_http2", r.disableHTTP2),
 	))
+
+	// Enforce a per-host concurrency limit so that multiple workers cannot
+	// hammer the same origin server simultaneously.
+	hostLimiter := ratelimit.Shared()
+	requestHost := urllib.Domain(requestURL)
+	hostLimiter.Acquire(requestHost)
+	defer hostLimiter.Release(requestHost)
 
 	return client.Do(req)
 }
