@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -578,4 +579,50 @@ func configureFetcherAllowPrivateNetworksOption(t *testing.T, value string) {
 	t.Cleanup(func() {
 		config.Opts = previousOptions
 	})
+}
+
+func TestRequestBuilderExecuteRequestSerializesRequestsPerHost(t *testing.T) {
+	var mutex sync.Mutex
+	current := 0
+	maxObserved := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		current++
+		if current > maxObserved {
+			maxObserved = current
+		}
+		mutex.Unlock()
+
+		time.Sleep(20 * time.Millisecond)
+
+		mutex.Lock()
+		current--
+		mutex.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	limiter := NewHostConcurrencyLimiter(1)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			resp, err := NewRequestBuilder().WithHostLimiter(limiter).ExecuteRequest(server.URL)
+			if err != nil {
+				t.Errorf("Expected no error, got %v", err)
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+
+	if maxObserved != 1 {
+		t.Errorf("Expected requests to the same host to be serialized, got %d concurrent requests", maxObserved)
+	}
 }

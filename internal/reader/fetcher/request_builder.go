@@ -44,6 +44,7 @@ type RequestBuilder struct {
 	disableCompression bool
 	proxyRotator       *proxyrotator.ProxyRotator
 	feedProxyURL       string
+	hostLimiter        *HostConcurrencyLimiter
 }
 
 func NewRequestBuilder() *RequestBuilder {
@@ -137,6 +138,13 @@ func (r *RequestBuilder) IgnoreTLSErrors(value bool) *RequestBuilder {
 
 func (r *RequestBuilder) WithoutCompression() *RequestBuilder {
 	r.disableCompression = true
+	return r
+}
+
+// WithHostLimiter sets the limiter used to restrict the number of concurrent
+// requests sent to the same host. When unset, DefaultHostLimiter is used.
+func (r *RequestBuilder) WithHostLimiter(hostLimiter *HostConcurrencyLimiter) *RequestBuilder {
+	r.hostLimiter = hostLimiter
 	return r
 }
 
@@ -279,6 +287,16 @@ func (r *RequestBuilder) ExecuteRequest(requestURL string) (*http.Response, erro
 		slog.Bool("ignore_tls_errors", r.ignoreTLSErrors),
 		slog.Bool("disable_http2", r.disableHTTP2),
 	))
+
+	// Throttle outgoing requests so that concurrent workers do not overwhelm
+	// the same host. The slot is released once the response headers are
+	// received (or when the request fails).
+	limiter := r.hostLimiter
+	if limiter == nil {
+		limiter = DefaultHostLimiter
+	}
+	release := limiter.Acquire(req.URL.Hostname())
+	defer release()
 
 	return client.Do(req)
 }

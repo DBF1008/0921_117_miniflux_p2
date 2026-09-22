@@ -292,3 +292,52 @@ func TestResponseHandlerCloseClosesBodyOnClientError(t *testing.T) {
 		t.Error("Expected response body to be closed")
 	}
 }
+
+func TestStatusCode(t *testing.T) {
+	handler := NewResponseHandler(&http.Response{StatusCode: http.StatusTooManyRequests}, nil)
+	if handler.StatusCode() != http.StatusTooManyRequests {
+		t.Errorf("Expected status code %d, got %d", http.StatusTooManyRequests, handler.StatusCode())
+	}
+
+	nilHandler := NewResponseHandler(nil, errors.New("network error"))
+	if nilHandler.StatusCode() != 0 {
+		t.Errorf("Expected status code 0 when the response is nil, got %d", nilHandler.StatusCode())
+	}
+}
+
+func TestIsServerError(t *testing.T) {
+	testCases := map[int]bool{
+		http.StatusOK:                  false,
+		http.StatusTooManyRequests:     false,
+		http.StatusInternalServerError: true,
+		http.StatusBadGateway:          true,
+		http.StatusServiceUnavailable:  true,
+		http.StatusGatewayTimeout:      true,
+	}
+
+	for statusCode, expected := range testCases {
+		handler := NewResponseHandler(&http.Response{StatusCode: statusCode}, nil)
+		if handler.IsServerError() != expected {
+			t.Errorf("IsServerError for status code %d should be %v", statusCode, expected)
+		}
+	}
+
+	nilHandler := NewResponseHandler(nil, errors.New("network error"))
+	if nilHandler.IsServerError() {
+		t.Error("IsServerError should be false when the response is nil")
+	}
+}
+
+func TestParseRetryDelayWithNilResponse(t *testing.T) {
+	handler := NewResponseHandler(nil, errors.New("network error"))
+	if delay := handler.ParseRetryDelay(); delay != 0 {
+		t.Errorf("Expected a zero retry delay when the response is nil, got %s", delay)
+	}
+}
+
+func TestCacheControlMaxAgeWithNilResponse(t *testing.T) {
+	handler := NewResponseHandler(nil, errors.New("network error"))
+	if maxAge := handler.CacheControlMaxAge(); maxAge != 0 {
+		t.Errorf("Expected a zero max-age when the response is nil, got %s", maxAge)
+	}
+}

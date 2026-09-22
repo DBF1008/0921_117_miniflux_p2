@@ -52,11 +52,11 @@ func refreshFeeds(store *storage.Storage) {
 					slog.Int("worker_id", workerID),
 				)
 
-				if localizedError := feedHandler.RefreshFeed(store, job.UserID, job.FeedID, false); localizedError != nil {
+				if result := feedHandler.RefreshFeed(store, job.UserID, job.FeedID, false); result.LocalizedError != nil {
 					slog.Warn("Unable to refresh feed",
 						slog.Int64("feed_id", job.FeedID),
 						slog.Int64("user_id", job.UserID),
-						slog.Any("error", localizedError.Error()),
+						slog.Any("error", result.LocalizedError.Error()),
 					)
 				}
 			}

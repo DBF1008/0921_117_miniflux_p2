@@ -554,13 +554,17 @@ based on their last refresh time\&.
 Default is 60 minutes\&.
 .TP
 .B POLLING_LIMIT_PER_HOST
-Limits the number of concurrent requests to the same hostname
-when polling feeds.
+Limits the number of feeds from the same hostname included in
+each batch when polling feeds.
+.br
+When set, it also caps the number of simultaneous HTTP requests
+sent to the same hostname by the worker pool; otherwise only one
+concurrent request per hostname is allowed.
 .br
 This helps prevent overwhelming a single server during batch
 processing by the worker pool.
 .br
-Default is 0 (disabled)\&.
+Default is 0 (one concurrent request per hostname)\&.
 .TP
 .B POLLING_PARSING_ERROR_LIMIT
 The maximum number of parsing errors that the program will

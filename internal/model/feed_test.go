@@ -376,3 +376,111 @@ func TestFeedScheduleNextCheckEntryFrequencyLargeNewTTL(t *testing.T) {
 		t.Error(`The next_check_at should be after timeBefore + entry frequency min interval`)
 	}
 }
+
+func TestFeedScheduleBackoffUsesBaseIntervalForFirstError(t *testing.T) {
+	os.Clearenv()
+
+	var err error
+	parser := config.NewConfigParser()
+	config.Opts, err = parser.ParseEnvironmentVariables()
+	if err != nil {
+		t.Fatalf(`Parsing failure: %v`, err)
+	}
+
+	baseInterval := config.Opts.SchedulerRoundRobinMinInterval()
+
+	timeBefore := time.Now()
+	feed := &Feed{}
+	interval := feed.ScheduleBackoff(1, noRefreshDelay)
+
+	if interval != baseInterval {
+		t.Errorf(`The backoff interval for the first error should be the base interval %s, got %s`, baseInterval, interval)
+	}
+	checkTargetInterval(t, feed, baseInterval, timeBefore, "TestFeedScheduleBackoffUsesBaseIntervalForFirstError")
+}
+
+func TestFeedScheduleBackoffGrowsExponentially(t *testing.T) {
+	os.Clearenv()
+
+	var err error
+	parser := config.NewConfigParser()
+	config.Opts, err = parser.ParseEnvironmentVariables()
+	if err != nil {
+		t.Fatalf(`Parsing failure: %v`, err)
+	}
+
+	baseInterval := config.Opts.SchedulerRoundRobinMinInterval()
+
+	for errorCount := 1; errorCount <= 4; errorCount++ {
+		feed := &Feed{}
+		interval := feed.ScheduleBackoff(errorCount, noRefreshDelay)
+		expectedInterval := baseInterval << (errorCount - 1)
+		if interval != expectedInterval {
+			t.Errorf(`The backoff interval for %d errors should be %s, got %s`, errorCount, expectedInterval, interval)
+		}
+	}
+}
+
+func TestFeedScheduleBackoffIsCappedAtMaxInterval(t *testing.T) {
+	os.Clearenv()
+
+	var err error
+	parser := config.NewConfigParser()
+	config.Opts, err = parser.ParseEnvironmentVariables()
+	if err != nil {
+		t.Fatalf(`Parsing failure: %v`, err)
+	}
+
+	maxInterval := config.Opts.SchedulerRoundRobinMaxInterval()
+
+	timeBefore := time.Now()
+	feed := &Feed{}
+	interval := feed.ScheduleBackoff(100, noRefreshDelay)
+
+	if interval != maxInterval {
+		t.Errorf(`The backoff interval should be capped at %s, got %s`, maxInterval, interval)
+	}
+	checkTargetInterval(t, feed, maxInterval, timeBefore, "TestFeedScheduleBackoffIsCappedAtMaxInterval")
+}
+
+func TestFeedScheduleBackoffHonorsRetryDelay(t *testing.T) {
+	os.Clearenv()
+
+	var err error
+	parser := config.NewConfigParser()
+	config.Opts, err = parser.ParseEnvironmentVariables()
+	if err != nil {
+		t.Fatalf(`Parsing failure: %v`, err)
+	}
+
+	retryDelay := 2 * config.Opts.SchedulerRoundRobinMinInterval()
+
+	timeBefore := time.Now()
+	feed := &Feed{}
+	interval := feed.ScheduleBackoff(1, retryDelay)
+
+	if interval != retryDelay {
+		t.Errorf(`The backoff interval should honor the retry delay %s, got %s`, retryDelay, interval)
+	}
+	checkTargetInterval(t, feed, retryDelay, timeBefore, "TestFeedScheduleBackoffHonorsRetryDelay")
+}
+
+func TestFeedScheduleBackoffCapsExcessiveRetryDelay(t *testing.T) {
+	os.Clearenv()
+
+	var err error
+	parser := config.NewConfigParser()
+	config.Opts, err = parser.ParseEnvironmentVariables()
+	if err != nil {
+		t.Fatalf(`Parsing failure: %v`, err)
+	}
+
+	maxInterval := config.Opts.SchedulerRoundRobinMaxInterval()
+
+	feed := &Feed{}
+	interval := feed.ScheduleBackoff(1, 72*time.Hour)
+
+	if interval != maxInterval {
+		t.Errorf(`An excessive retry delay should be capped at %s, got %s`, maxInterval, interval)
+	}
+}

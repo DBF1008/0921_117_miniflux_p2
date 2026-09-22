@@ -64,9 +64,9 @@ func (h *handler) refreshFeedHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	localizedError := feedHandler.RefreshFeed(h.store, userID, feedID, false)
-	if localizedError != nil {
-		response.JSONServerError(w, r, localizedError.Error())
+	result := feedHandler.RefreshFeed(h.store, userID, feedID, false)
+	if result.LocalizedError != nil {
+		response.JSONServerError(w, r, result.LocalizedError.Error())
 		return
 	}
 

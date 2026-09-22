@@ -148,6 +148,36 @@ func (f *Feed) ScheduleNextCheck(weeklyCount int, refreshDelay time.Duration) ti
 	return interval
 }
 
+// ScheduleBackoff sets "next_check_at" using an exponential backoff strategy
+// driven by the number of consecutive errors. Server-provided delays
+// (Retry-After header, Cache-Control max-age) take precedence when larger.
+func (f *Feed) ScheduleBackoff(errorCount int, retryDelay time.Duration) time.Duration {
+	baseInterval := config.Opts.SchedulerRoundRobinMinInterval()
+
+	var maxInterval time.Duration
+	switch config.Opts.PollingScheduler() {
+	case SchedulerEntryFrequency:
+		maxInterval = config.Opts.SchedulerEntryFrequencyMaxInterval()
+	default:
+		maxInterval = config.Opts.SchedulerRoundRobinMaxInterval()
+	}
+
+	interval := baseInterval
+	for i := 1; i < errorCount; i++ {
+		interval *= 2
+		if interval >= maxInterval {
+			interval = maxInterval
+			break
+		}
+	}
+
+	interval = max(interval, retryDelay)
+	interval = min(interval, maxInterval)
+
+	f.NextCheckAt = time.Now().Add(interval)
+	return interval
+}
+
 // FeedCreationRequest represents the request to create a feed.
 type FeedCreationRequest struct {
 	FeedURL                     string `json:"feed_url"`

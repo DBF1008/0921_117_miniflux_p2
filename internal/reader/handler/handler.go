@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"miniflux.app/v2/internal/config"
@@ -26,6 +27,53 @@ var (
 	ErrFeedNotFound     = errors.New("fetcher: feed not found")
 	ErrDuplicatedFeed   = errors.New("fetcher: duplicated feed")
 )
+
+const (
+	// defaultHostCooldown is the delay applied to a throttled host when the
+	// server did not provide any retry hint.
+	defaultHostCooldown = time.Minute
+	// maxHostCooldown caps the delay applied to a throttled host.
+	maxHostCooldown = 5 * time.Minute
+)
+
+// RefreshResult describes the outcome of a feed refresh so that workers and
+// schedulers can make throttling decisions based on the error type.
+type RefreshResult struct {
+	FeedID         int64
+	HTTPStatusCode int
+	RetryDelay     time.Duration
+	BackoffDelay   time.Duration
+	LocalizedError *locale.LocalizedErrorWrapper
+}
+
+// IsRateLimited returns true when the server responded with a 429 status code.
+func (r *RefreshResult) IsRateLimited() bool {
+	return r.HTTPStatusCode == http.StatusTooManyRequests
+}
+
+// IsServerError returns true when the server responded with a 5xx status code.
+func (r *RefreshResult) IsServerError() bool {
+	return r.HTTPStatusCode >= http.StatusInternalServerError && r.HTTPStatusCode < 600
+}
+
+// ShouldThrottleHost returns true when the failure is server-side (429 or
+// 5xx), meaning subsequent requests to the same host should be delayed.
+func (r *RefreshResult) ShouldThrottleHost() bool {
+	return r.IsRateLimited() || r.IsServerError()
+}
+
+// HostCooldown returns the delay during which new requests to the feed host
+// should be avoided. It prefers the server-provided retry delay and falls
+// back to a default cooldown.
+func (r *RefreshResult) HostCooldown() time.Duration {
+	if !r.ShouldThrottleHost() {
+		return 0
+	}
+	if r.RetryDelay > 0 {
+		return min(r.RetryDelay, maxHostCooldown)
+	}
+	return defaultHostCooldown
+}
 
 func getTranslatedLocalizedError(store *storage.Storage, userID int64, originalFeed *model.Feed, localizedError *locale.LocalizedErrorWrapper) *locale.LocalizedErrorWrapper {
 	user, storeErr := store.UserByID(userID)
@@ -204,7 +252,7 @@ func CreateFeed(store *storage.Storage, userID int64, feedCreationRequest *model
 }
 
 // RefreshFeed refreshes a feed.
-func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool) *locale.LocalizedErrorWrapper {
+func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool) *RefreshResult {
 	slog.Debug("Begin feed refresh process",
 		slog.Int64("user_id", userID),
 		slog.Int64("feed_id", feedID),
@@ -213,11 +261,11 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 
 	originalFeed, storeErr := store.FeedByID(userID, feedID)
 	if storeErr != nil {
-		return locale.NewLocalizedErrorWrapper(storeErr, "error.database_error", storeErr)
+		return &RefreshResult{FeedID: feedID, LocalizedError: locale.NewLocalizedErrorWrapper(storeErr, "error.database_error", storeErr)}
 	}
 
 	if originalFeed == nil {
-		return locale.NewLocalizedErrorWrapper(ErrFeedNotFound, "error.feed_not_found")
+		return &RefreshResult{FeedID: feedID, LocalizedError: locale.NewLocalizedErrorWrapper(ErrFeedNotFound, "error.feed_not_found")}
 	}
 
 	weeklyEntryCount := 0
@@ -225,7 +273,7 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 		var weeklyCountErr error
 		weeklyEntryCount, weeklyCountErr = store.WeeklyFeedEntryCount(userID, feedID)
 		if weeklyCountErr != nil {
-			return locale.NewLocalizedErrorWrapper(weeklyCountErr, "error.database_error", weeklyCountErr)
+			return &RefreshResult{FeedID: feedID, LocalizedError: locale.NewLocalizedErrorWrapper(weeklyCountErr, "error.database_error", weeklyCountErr)}
 		}
 	}
 
@@ -253,31 +301,40 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 	responseHandler := fetcher.NewResponseHandler(requestBuilder.ExecuteRequest(originalFeed.FeedURL))
 	defer responseHandler.Close()
 
-	if responseHandler.IsRateLimited() {
-		retryDelay := responseHandler.ParseRetryDelay()
-		calculatedNextCheckInterval := originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
-
-		slog.Warn("Feed is rate limited",
-			slog.String("feed_url", originalFeed.FeedURL),
-			slog.Int("retry_delay_in_seconds", int(retryDelay.Seconds())),
-			slog.Int("calculated_next_check_interval_in_minutes", int(calculatedNextCheckInterval.Minutes())),
-			slog.Time("new_next_check_at", originalFeed.NextCheckAt),
-		)
-	}
-
 	if localizedError := responseHandler.LocalizedError(); localizedError != nil {
-		slog.Warn("Unable to fetch feed",
+		// Honor server-provided delays (Retry-After, Cache-Control max-age)
+		// and apply an exponential backoff so that failing feeds are not
+		// requested again on every polling cycle.
+		retryDelay := max(responseHandler.ParseRetryDelay(), responseHandler.CacheControlMaxAge())
+		backoffDelay := originalFeed.ScheduleBackoff(originalFeed.ParsingErrorCount+1, retryDelay)
+
+		slog.Warn("Unable to fetch feed, next check postponed with backoff",
 			slog.Int64("user_id", userID),
 			slog.Int64("feed_id", feedID),
 			slog.String("feed_url", originalFeed.FeedURL),
+			slog.Int("status_code", responseHandler.StatusCode()),
+			slog.Int("retry_delay_in_seconds", int(retryDelay.Seconds())),
+			slog.Int("backoff_delay_in_minutes", int(backoffDelay.Minutes())),
+			slog.Time("new_next_check_at", originalFeed.NextCheckAt),
 			slog.Any("error", localizedError.Error()),
 		)
-		return getTranslatedLocalizedError(store, userID, originalFeed, localizedError)
+
+		return &RefreshResult{
+			FeedID:         feedID,
+			HTTPStatusCode: responseHandler.StatusCode(),
+			RetryDelay:     retryDelay,
+			BackoffDelay:   backoffDelay,
+			LocalizedError: getTranslatedLocalizedError(store, userID, originalFeed, localizedError),
+		}
 	}
 
 	if store.AnotherFeedURLExists(userID, originalFeed.ID, responseHandler.EffectiveURL()) {
 		localizedError := locale.NewLocalizedErrorWrapper(ErrDuplicatedFeed, "error.duplicated_feed")
-		return getTranslatedLocalizedError(store, userID, originalFeed, localizedError)
+		return &RefreshResult{
+			FeedID:         feedID,
+			HTTPStatusCode: responseHandler.StatusCode(),
+			LocalizedError: getTranslatedLocalizedError(store, userID, originalFeed, localizedError),
+		}
 	}
 
 	if ignoreHTTPCache || responseHandler.IsModified(originalFeed.EtagHeader, originalFeed.LastModifiedHeader) {
@@ -291,7 +348,7 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 		responseBody, localizedError := responseHandler.ReadBody(config.Opts.HTTPClientMaxBodySize())
 		if localizedError != nil {
 			slog.Warn("Unable to fetch feed", slog.String("feed_url", originalFeed.FeedURL), slog.Any("error", localizedError.Error()))
-			return localizedError
+			return &RefreshResult{FeedID: feedID, HTTPStatusCode: responseHandler.StatusCode(), LocalizedError: localizedError}
 		}
 
 		updatedFeed, parseErr := parser.ParseFeed(responseHandler.EffectiveURL(), bytes.NewReader(responseBody))
@@ -300,7 +357,11 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 			if errors.Is(parseErr, parser.ErrFeedFormatNotDetected) {
 				localizedError = locale.NewLocalizedErrorWrapper(parseErr, "error.feed_format_not_detected", parseErr)
 			}
-			return getTranslatedLocalizedError(store, userID, originalFeed, localizedError)
+			return &RefreshResult{
+				FeedID:         feedID,
+				HTTPStatusCode: responseHandler.StatusCode(),
+				LocalizedError: getTranslatedLocalizedError(store, userID, originalFeed, localizedError),
+			}
 		}
 
 		// Use the RSS TTL value, or the Cache-Control or Expires HTTP headers if available.
@@ -335,7 +396,11 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 		newEntries, storeErr := store.RefreshFeedEntries(originalFeed.UserID, originalFeed.ID, originalFeed.Entries, updateExistingEntries)
 		if storeErr != nil {
 			localizedError := locale.NewLocalizedErrorWrapper(storeErr, "error.database_error", storeErr)
-			return getTranslatedLocalizedError(store, userID, originalFeed, localizedError)
+			return &RefreshResult{
+				FeedID:         feedID,
+				HTTPStatusCode: responseHandler.StatusCode(),
+				LocalizedError: getTranslatedLocalizedError(store, userID, originalFeed, localizedError),
+			}
 		}
 
 		userIntegrations, intErr := store.Integration(userID)
@@ -376,8 +441,8 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 
 	if storeErr := store.UpdateFeed(originalFeed); storeErr != nil {
 		localizedError := locale.NewLocalizedErrorWrapper(storeErr, "error.database_error", storeErr)
-		return getTranslatedLocalizedError(store, userID, originalFeed, localizedError)
+		return &RefreshResult{FeedID: feedID, LocalizedError: getTranslatedLocalizedError(store, userID, originalFeed, localizedError)}
 	}
 
-	return nil
+	return &RefreshResult{FeedID: feedID}
 }

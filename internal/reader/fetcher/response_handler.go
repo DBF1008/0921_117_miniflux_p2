@@ -66,6 +66,9 @@ func (r *ResponseHandler) Expires() time.Duration {
 }
 
 func (r *ResponseHandler) CacheControlMaxAge() time.Duration {
+	if r.httpResponse == nil {
+		return 0
+	}
 	cacheControlHeaderValue := r.httpResponse.Header.Get("Cache-Control")
 	if cacheControlHeaderValue != "" {
 		for directive := range strings.SplitSeq(cacheControlHeaderValue, ",") {
@@ -80,6 +83,9 @@ func (r *ResponseHandler) CacheControlMaxAge() time.Duration {
 }
 
 func (r *ResponseHandler) ParseRetryDelay() time.Duration {
+	if r.httpResponse == nil {
+		return 0
+	}
 	retryAfterHeaderValue := r.httpResponse.Header.Get("Retry-After")
 	if retryAfterHeaderValue != "" {
 		// First, try to parse as an integer (number of seconds)
@@ -97,6 +103,22 @@ func (r *ResponseHandler) ParseRetryDelay() time.Duration {
 
 func (r *ResponseHandler) IsRateLimited() bool {
 	return r.httpResponse != nil && r.httpResponse.StatusCode == http.StatusTooManyRequests
+}
+
+// StatusCode returns the HTTP status code of the response, or 0 when the
+// request failed before a response was received.
+func (r *ResponseHandler) StatusCode() int {
+	if r.httpResponse == nil {
+		return 0
+	}
+	return r.httpResponse.StatusCode
+}
+
+// IsServerError returns true when the response status code is a 5xx error.
+func (r *ResponseHandler) IsServerError() bool {
+	return r.httpResponse != nil &&
+		r.httpResponse.StatusCode >= http.StatusInternalServerError &&
+		r.httpResponse.StatusCode < 600
 }
 
 func (r *ResponseHandler) IsModified(lastEtagValue, lastModifiedValue string) bool {
